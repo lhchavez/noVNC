@@ -13,6 +13,7 @@ import { encodeUTF8, decodeUTF8 } from './util/strings.js';
 import { dragThreshold } from './util/browser.js';
 import { clientToElement } from './util/element.js';
 import { setCapture } from './util/events.js';
+import AudioBuffer from './util/audio.js';
 import EventTargetMixin from './util/eventtarget.js';
 import Display from "./display.js";
 import Inflator from "./inflator.js";
@@ -494,6 +495,15 @@ export default class RFB extends EventTargetMixin {
 
             RFB.messages.clientCutText(this._sock, data);
         }
+    }
+
+    enableAudio(sampleFormat, channels, frequency) {
+        RFB.messages.SetQEMUExtendedAudioFormat(this._sock, sampleFormat, channels, frequency);
+        RFB.messages.ToggleQEMUExtendedAudio(this._sock, true);
+    }
+
+    disableAudio() {
+        RFB.messages.ToggleQEMUExtendedAudio(this._sock, false);
     }
 
     // ===== PRIVATE METHODS =====
@@ -2025,6 +2035,25 @@ export default class RFB extends EventTargetMixin {
         return true;
     }
 
+    _handleQEMUExtAudioMsg() {
+        if (this._sock.rQwait("QEMU extended audio message", 3, 1)) { return false; }
+
+        this._sock.rQshift8(); // for now there is only a single submessage type 1
+        const operation = this._sock.rQshift16();
+
+        if (operation === 1) { // stream is starting
+            this._audioBuffer = new AudioBuffer('audio/webm; codecs="opus"'); // TODO: This is obviously not the right value to use here
+        } else if (operation === 0) { // stream is stopping
+            this._audioBuffer.close();
+        } else {  // stream data
+            const length = this._sock.rQshift32();
+            const data = this._sock.rQshiftBytes(length);
+            this._audioBuffer.queueAudio(data);
+        }
+
+        return true;
+    }
+
     _handleXvpMsg() {
         if (this._sock.rQwait("XVP version and message", 3, 1)) { return false; }
         this._sock.rQskipBytes(1);  // Padding
@@ -2098,6 +2127,9 @@ export default class RFB extends EventTargetMixin {
 
             case 250:  // XVP
                 return this._handleXvpMsg();
+
+            case 255: // Qemu extended audio message
+                return this._handleQEMUExtAudioMsg();
 
             default:
                 this._fail("Unexpected server message (type " + msgType + ")");
@@ -2527,6 +2559,16 @@ export default class RFB extends EventTargetMixin {
     }
 }
 
+// Audio sample formats
+RFB.sampleFormats = {
+    U8: 0,
+    S8: 1,
+    U16: 2,
+    S16: 3,
+    U32: 4,
+    S32: 5
+};
+
 // Class Methods
 RFB.messages = {
     keyEvent(sock, keysym, down) {
@@ -2545,6 +2587,48 @@ RFB.messages = {
         buff[offset + 7] = keysym;
 
         sock._sQlen += 8;
+        sock.flush();
+    },
+
+    ToggleQEMUExtendedAudio(sock, enabled) {
+        const buff = sock._sQ;
+        const offset = sock._sQlen;
+
+        buff[offset] = 255;        // msg-type
+        buff[offset + 1] = 1;      // sub msg-type
+
+        buff[offset + 2] = 0;      // operation
+        if (enabled) {
+            buff[offset + 3] = 0;
+        } else {
+            buff[offset + 3] = 1;
+        }
+
+        sock._sQlen += 4;
+        sock.flush();
+    },
+
+    SetQEMUExtendedAudioFormat(sock, sampleFormat, channels, frequency) {
+        const buff = sock._sQ;
+        const offset = sock._sQlen;
+
+        buff[offset] = 255;     // msg type
+        buff[offset + 1] = 1;   // sub msg-type
+
+        buff[offset + 2] = 0;   // operation
+        buff[offset + 3] = 2;
+
+        buff[offset + 4] = sampleFormat;
+        buff[offset + 5] = channels;
+
+        const freq = toUnsigned32bit(frequency);
+
+        buff[offset + 6] = freq >> 24;
+        buff[offset + 7] = freq >> 16;
+        buff[offset + 8] = freq >> 8;
+        buff[offset + 9] = freq;
+
+        sock._sQlen += 10;
         sock.flush();
     },
 
